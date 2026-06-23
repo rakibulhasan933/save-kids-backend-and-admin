@@ -23,6 +23,7 @@ import {
 
 type ViewerStatus = "idle" | "waiting" | "streaming" | "ended";
 type SocketStatus = "connecting" | "connected" | "disconnected";
+type ChildSignalState = "unknown" | "idle" | "active";
 
 type Child = {
   id: string;
@@ -59,14 +60,16 @@ export function LiveScreenViewer({ childId, showChildHeader = true }: { childId:
   const [endedReason, setEndedReason] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [socketStatus, setSocketStatus] = useState<SocketStatus>("disconnected");
-  const [childSignalState, setChildSignalState] = useState<string>("unknown");
+  const [childSignalState, setChildSignalState] = useState<ChildSignalState>("unknown");
+  const [childSignalUpdatedAt, setChildSignalUpdatedAt] = useState<string | null>(null);
   const socketConnected = socketStatus === "connected";
+  const childQueryEnabled = hasValidChildId;
 
   const sessionsQueryKey = useMemo(() => ["live-screen", childId], [childId]);
   const childQuery = useQuery({
     queryKey: ["child", childId],
     queryFn: () => apiFetch<{ child: Child }>(`/api/children/${childId}`),
-    enabled: showChildHeader
+    enabled: childQueryEnabled
   });
   const sessionsQuery = useQuery({
     queryKey: sessionsQueryKey,
@@ -78,6 +81,11 @@ export function LiveScreenViewer({ childId, showChildHeader = true }: { childId:
     statusRef.current = nextStatus;
     setStatusState(nextStatus);
   }, []);
+
+  const childPresence = useMemo(
+    () => getChildPresence(childQuery.data?.child ?? null, childSignalUpdatedAt),
+    [childQuery.data?.child, childSignalUpdatedAt]
+  );
 
   const clearVideo = useCallback(() => {
     const video = videoRef.current;
@@ -176,7 +184,8 @@ export function LiveScreenViewer({ childId, showChildHeader = true }: { childId:
 
       if (message.type === "STATUS_UPDATE") {
         if (message.payload.childId !== childId) return;
-        setChildSignalState(message.payload.state);
+        setChildSignalState(normalizeChildSignalState(message.payload.state));
+        setChildSignalUpdatedAt(message.payload.timestamp);
         return;
       }
 
@@ -310,9 +319,10 @@ export function LiveScreenViewer({ childId, showChildHeader = true }: { childId:
       void queryClient.invalidateQueries({ queryKey: sessionsQueryKey });
 
       if (data.signaling?.delivered === 0) {
-        toast.error("Child device is offline");
-        setError("Child device is offline");
-        cleanupLocalSession("idle", data.signaling.reason ?? "child_offline", "Child device is offline");
+        const offlineReason = data.signaling.reason ?? "Child device is offline";
+        toast.error(offlineReason);
+        setError(offlineReason);
+        cleanupLocalSession("idle", data.signaling.reason ?? "child_offline", offlineReason);
       } else {
         toast.success("Live screen requested");
       }
@@ -353,7 +363,13 @@ export function LiveScreenViewer({ childId, showChildHeader = true }: { childId:
   });
 
   const canRequest =
-    hasValidChildId && socketConnected && status !== "waiting" && status !== "streaming" && !requestSession.isPending;
+    hasValidChildId &&
+    socketConnected &&
+    childPresence.isOnline &&
+    childQuery.data?.child.status !== "disabled" &&
+    status !== "waiting" &&
+    status !== "streaming" &&
+    !requestSession.isPending;
   const canEnd = Boolean(currentSessionId) && (status === "waiting" || status === "streaming") && !endSession.isPending;
 
   return (
@@ -387,7 +403,8 @@ export function LiveScreenViewer({ childId, showChildHeader = true }: { childId:
         <CardContent className="space-y-4">
           <div className="grid gap-3 text-sm md:grid-cols-4">
             <StatusItem label="Viewer status" value={statusLabel(status, endedReason)} />
-            <StatusItem label="Child signal" value={childSignalState} />
+            <StatusItem label="Child signal" value={childSignalLabel(childSignalState, childSignalUpdatedAt)} />
+            <StatusItem label="Child presence" value={childPresence.label} />
             <StatusItem label="WebSocket" value={socketStatusLabel(socketStatus)} />
             <StatusItem label="Session" value={currentSessionId ? shortId(currentSessionId) : "-"} />
           </div>
@@ -397,6 +414,8 @@ export function LiveScreenViewer({ childId, showChildHeader = true }: { childId:
               {error}
             </div>
           ) : null}
+
+          {childPresence.reason ? <p className="text-xs text-muted-foreground">{childPresence.reason}</p> : null}
 
           <div className="relative aspect-video overflow-hidden rounded-md border bg-black">
             <video ref={videoRef} className="h-full w-full bg-black object-contain" autoPlay playsInline muted />
@@ -486,3 +505,78 @@ function videoPlaceholder(status: ViewerStatus) {
 function shortId(id: string) {
   return id.slice(0, 8);
 }
+
+function normalizeChildSignalState(state: string): ChildSignalState {
+  if (state === "IDLE" || state === "PAIRED_IDLE") return "idle";
+  if (state === "MONITORING_ACTIVE" || state === "LIVE_SCREEN_ACTIVE" || state === "LIVE_SCREEN_ENDING") {
+    return "active";
+  }
+  return "unknown";
+}
+
+function childSignalLabel(state: ChildSignalState, updatedAt: string | null) {
+  const freshness = updatedAt ? `, updated ${formatUpdatedAt(updatedAt)}` : "";
+  if (state === "idle") return `Idle${freshness}`;
+  if (state === "active") return `Active${freshness}`;
+  return `Unknown${freshness}`;
+}
+
+function getChildPresence(child: Child | null, lastSignalAt: string | null) {
+  if (!child) {
+    return {
+      isOnline: false,
+      label: "Unknown",
+      reason: "No child data loaded yet"
+    };
+  }
+
+  if (child.status === "disabled") {
+    return {
+      isOnline: false,
+      label: "Disabled",
+      reason: "Child is disabled"
+    };
+  }
+
+  const signalSource = lastSignalAt ?? child.lastSeenAt;
+  if (!signalSource) {
+    return {
+      isOnline: false,
+      label: "Offline",
+      reason: "Child considered offline because no STATUS_UPDATE has been received yet"
+    };
+  }
+
+  const ageMs = Date.now() - new Date(signalSource).getTime();
+  if (Number.isNaN(ageMs) || ageMs > CHILD_STATUS_STALE_MS) {
+    return {
+      isOnline: false,
+      label: "Offline",
+      reason: `Child considered offline because no STATUS_UPDATE within ${Math.round(
+        CHILD_STATUS_STALE_MS / 1000
+      )} seconds`
+    };
+  }
+
+  return {
+    isOnline: true,
+    label: "Online",
+    reason: null
+  };
+}
+
+function formatUpdatedAt(updatedAt: string) {
+  const ageMs = Date.now() - new Date(updatedAt).getTime();
+  if (Number.isNaN(ageMs) || ageMs < 0) return "just now";
+
+  const seconds = Math.floor(ageMs / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ago`;
+}
+
+const CHILD_STATUS_STALE_MS = 120_000;

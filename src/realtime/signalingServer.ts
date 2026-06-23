@@ -2,7 +2,7 @@ import type { IncomingMessage, Server as HttpServer } from "node:http";
 import { eq } from "drizzle-orm";
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import { db } from "@/db";
-import { children, liveScreenSessions } from "@/db/schema";
+import { childDevices, children, liveScreenSessions } from "@/db/schema";
 import {
   bindLiveScreenTarget,
   broadcastToAdmin,
@@ -171,6 +171,12 @@ async function handleMessage(ws: WebSocket, data: RawData) {
 
   const parsed = clientMessageSchema.safeParse(raw);
   if (!parsed.success) {
+    if (raw && typeof raw === "object" && (raw as { type?: unknown }).type === "STATUS_UPDATE") {
+      console.warn("[ws] Rejected malformed STATUS_UPDATE", {
+        issues: parsed.error.issues,
+        raw
+      });
+    }
     sendError(ws, "INVALID_MESSAGE", "Message type or payload is invalid");
     return;
   }
@@ -217,6 +223,18 @@ async function handleStatusUpdate(ws: WebSocket, message: Extract<ClientMessage,
   }
 
   if (message.payload.childId !== context.childId || message.payload.deviceUuid !== context.deviceUuid) {
+    console.warn("[ws] Rejected STATUS_UPDATE due to identity mismatch", {
+      socket: {
+        childId: context.childId,
+        deviceUuid: context.deviceUuid
+      },
+      payload: {
+        childId: message.payload.childId,
+        deviceUuid: message.payload.deviceUuid,
+        state: message.payload.state,
+        timestamp: message.payload.timestamp
+      }
+    });
     sendError(ws, "FORBIDDEN", "Status update identity does not match socket identity");
     return;
   }
@@ -231,6 +249,11 @@ async function handleStatusUpdate(ws: WebSocket, message: Extract<ClientMessage,
     sendError(ws, "NOT_FOUND", "Child not found");
     return;
   }
+
+  await db
+    .update(childDevices)
+    .set({ lastOnlineAt: new Date(), updatedAt: new Date() })
+    .where(eq(childDevices.deviceUuid, context.deviceUuid));
 
   broadcastToAdmin(child.adminId, message);
 }
@@ -401,9 +424,50 @@ export async function signalLiveScreenRequest(
   } satisfies ServerMessage;
 
   const delivered = broadcastToChild(session.childId, message);
-  return delivered > 0
-    ? { delivered, reason: null }
-    : { delivered, reason: "CHILD_OFFLINE" as const };
+  if (delivered > 0) {
+    return { delivered, reason: null };
+  }
+
+  const offlineReason = await describeChildOfflineReason(session.childId);
+  console.warn("[ws] LIVE_SCREEN_REQUEST could not be delivered", {
+    sessionId: session.id,
+    childId: session.childId,
+    adminId: session.adminId,
+    reason: offlineReason
+  });
+
+  return { delivered, reason: offlineReason };
+}
+
+const CHILD_STATUS_STALE_MS = 120_000;
+
+async function describeChildOfflineReason(childId: string) {
+  const [child] = await db
+    .select({ lastSeenAt: children.lastSeenAt, status: children.status })
+    .from(children)
+    .where(eq(children.id, childId))
+    .limit(1);
+
+  if (!child) {
+    return "Child record not found";
+  }
+
+  if (!child.lastSeenAt) {
+    return "Child considered offline because no STATUS_UPDATE has been received yet";
+  }
+
+  if (child.status === "disabled") {
+    return "Child is disabled";
+  }
+
+  const ageMs = Date.now() - child.lastSeenAt.getTime();
+  if (ageMs > CHILD_STATUS_STALE_MS) {
+    return `Child considered offline because no STATUS_UPDATE within ${Math.round(
+      CHILD_STATUS_STALE_MS / 1000
+    )} seconds`;
+  }
+
+  return "Child socket is not connected to the signaling server";
 }
 
 async function getSession(sessionId: string) {

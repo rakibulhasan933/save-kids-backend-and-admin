@@ -1,10 +1,12 @@
 import { z } from "zod";
 
 export const deviceStateSchema = z.enum([
+  "IDLE",
   "UNPAIRED",
   "PAIRED_IDLE",
   "MONITORING_ACTIVE",
   "LIVE_SCREEN_ACTIVE",
+  "LIVE_SCREEN_ENDING",
   "ERROR"
 ]);
 

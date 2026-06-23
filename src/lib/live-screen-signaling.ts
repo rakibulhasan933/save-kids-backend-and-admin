@@ -1,6 +1,12 @@
 "use client";
 
-export type ChildLiveScreenState = "IDLE" | "LIVE_SCREEN_ACTIVE" | "LIVE_SCREEN_ENDING";
+export type ChildLiveScreenState =
+  | "IDLE"
+  | "PAIRED_IDLE"
+  | "MONITORING_ACTIVE"
+  | "LIVE_SCREEN_ACTIVE"
+  | "LIVE_SCREEN_ENDING"
+  | "ERROR";
 
 export type SignalingMessage =
   | { type: "PING"; payload?: Record<string, never> }
